@@ -1,0 +1,233 @@
+#!/usr/bin/perl
+
+use Mojolicious::Lite -signatures;
+
+use Mojo::File            qw(path tempdir);
+use Mojo::Util            qw(encode);
+use IPC::Cmd              qw(run);
+use Cwd                   qw(cwd);
+use Email::Sender::Simple qw(sendmail);
+
+use Minion;
+use Email::MIME;
+
+our $VERSION = '0.01';
+
+my $config = plugin 'Config' => {
+    default => {
+        dbfile       => $ENV{BUILDBUNNY_DB}           || './minion.db',
+        token        => $ENV{BUILDBUNNY_TOKEN}        || 'secret',
+        build_dir    => $ENV{BUILDBUNNY_BUILD_DIR}    || '/tmp',
+        build_config => $ENV{BUILDBUNNY_BUILD_CONFIG} || './build.conf',
+        script_dir   => $ENV{BUILDBUNNY_SCRIPT_DIR}   || './scripts',
+        from         => $ENV{BUILDBUNNY_FROM} || 'build-bunny@localhost',
+    }
+};
+
+plugin Minion => { SQLite => $config->{dbfile} };
+plugin 'Minion::Admin';
+plugin 'TagHelpers';
+
+sub run_commands (@commands) {
+    my $output = '';
+    for my $command (@commands) {
+        my $ok = run( command => $command, buffer => \my $buffer );
+        $output .= $buffer;
+        if ( !$ok ) {
+            $output .= "Command failed: \'@$command\'\n";
+            return ( 1, $output );
+        }
+    }
+    return ( 0, $output );
+}
+
+app->minion->add_task(
+    build => sub ( $job, $url, $rev ) {
+
+        $job->app->log->info("Starting build for $url");
+
+        $config = $job->app->load_build_config($url);
+
+        if ( !$config ) {
+            die "Repository $url is not configured";
+        }
+
+        my $build_script = path( $job->app->config->{script_dir} )
+          ->child( path( $config->{script} || 'build.sh' )->basename )->to_abs;
+
+        if ( !-e $build_script ) {
+            die "Build script $build_script does not exist";
+        }
+
+        my $dir = tempdir( 'build-bunny-XXXXXXXX',
+            DIR => $job->app->config->{build_dir} );
+
+        my $cwd = cwd();
+
+        chdir($dir) or die "Could not change to $dir: $!";
+
+        my @git_checkout =
+          ( git => '-c', 'advice.detachedHead=false', 'checkout' );
+
+        my ( $ok, $output ) = run_commands(
+            [ git => clone => $url, $dir ],
+            [ @git_checkout, $rev ],
+            [$build_script],
+        );
+
+        chdir($cwd) or die "$!";    ## to avoid issues with tempdir cleanup
+
+        my $jobid = $job->id;
+        my $subject;
+
+        if ($ok) {
+            $subject = "Build $jobid failed for $url!";
+            $job->fail($output);
+        }
+        else {
+            $subject = "Build $jobid successful for $url!";
+            $job->finish($output);
+        }
+
+        if ( my $addresses = $config->{notify} ) {
+            $job->app->log->info("Sending notification to @$addresses");
+            my $mail = Email::MIME->create(
+                header_str => [
+                    To      => $addresses,
+                    From    => $c->config->{from},
+                    Subject => $subject,
+                ],
+                attributes => {
+                    content_type => "text/plain",
+                    charset      => "UTF-8",
+                },
+                body => encode( 'utf-8', $output ),
+            );
+            sendmail($mail);
+        }
+    }
+);
+
+get '/' => sub ($c) {
+    my $jobs = $c->minion->backend->list_jobs( 0, 10 );
+    use Data::Dumper;
+    $c->render( template => 'index', jobs => $jobs->{jobs} );
+};
+
+get '/notify' => sub ($c) {
+
+    my $token = $c->param('token');
+    if ( $token ne $c->config->{token} ) {
+        return $c->render( text => 'Invalid token', status => 403 );
+    }
+
+    my $url = $c->param('url');
+    my $rev = $c->param('rev');
+
+    if ( !$url ) {
+        return $c->render( text => 'Missing parameter url', status => 400 );
+    }
+    if ( !$rev ) {
+        return $c->render( text => 'Missing parameter rev', status => 400 );
+    }
+
+    $c->app->log->info("Received notification for $url");
+
+    my $build_config = $c->load_build_config($url);
+
+    if ( !$build_config ) {
+        $c->app->log->info(
+            "Skipping build for $url: Repository not configured");
+        return $c->render( text => 'Repository not configured', status => 400 );
+    }
+
+    my $jobid = $c->minion->enqueue( build => [ $url, $rev ] );
+    $c->render( text => "Job $jobid has been created." );
+};
+
+helper load_build_config => sub ( $c, $url ) {
+    state $config;
+    my $new_config = $c->load_config( $c->config->{build_config} );
+    if (%$new_config) {
+        $config = $new_config;
+    }
+    if ( exists $config->{$url} ) {
+        return $config->{$url};
+    }
+    return;
+};
+
+helper load_config => sub ( $c, $file ) {
+    $file = path($file);
+    if ( !-e $file ) {
+        $c->app->log->error("Configuration file $file does not exist");
+        return {};
+    }
+    my $content = $file->slurp;
+
+    my $config =
+      eval 'package Mojolicious::Plugin::Config::Sandbox; no warnings;'
+      . "use Mojo::Base -strict; $content";
+    if ($@) {
+        $c->app->log->error("Can't load configuration from file $file: $@");
+        return {};
+    }
+    if ( ref $config ne 'HASH' ) {
+        $c->app->log->error(
+            "Configuration file $file did not return a hash reference");
+        return {};
+    }
+    return $config;
+};
+
+helper maybe_abbreviate => sub ( $c, $text ) {
+    return '' if !$text;
+    return
+      length($text) > 8
+      ? $c->t( abbr => title => $text => substr( $text, 0, 8 ) . '...' )
+      : $text;
+};
+
+app->start;
+
+__DATA__
+
+@@ index.html.ep
+% title 'Jobs';
+<!doctype html><meta charset=utf-8><title>Build-Bunny</title>
+<style>
+    table {
+        text-align: left;
+    }
+    td,th {
+        padding: 0 15px;
+    }
+</style>
+<h1>Build-Bunny Jobs</h1>
+<table>
+    <tr>
+        <th>Build ID</th>
+        <th>Git-URL</th>
+        <th>Branch</th>
+        <th>State</th>
+        <th>Finished</th>
+    </tr>
+    % for my $job (@$jobs) {
+    <tr>
+        <td><%= $job->{id} %></td>
+        <td><strong><%= $job->{args}->[0] %></strong></td>
+        <td><%= maybe_abbreviate($job->{args}->[1]) %></td>
+        <td><%= $job->{state} %></td>
+        <td><%= Mojo::Date->new($job->{finished})->to_datetime %></td>
+    </tr>
+    <tr>
+        <td></td>
+        <td colspan="5">
+            <details>
+                <summary>Console Output</summary>
+                <pre><%= $job->{result} %></pre>
+            </details>
+        </td>
+    </tr>
+    % }
+</table>

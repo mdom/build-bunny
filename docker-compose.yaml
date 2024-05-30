@@ -1,0 +1,12 @@
+services:
+  web:
+    image: build-bunny:latest
+    restart: unless-stopped
+    environment:
+      - MOJO_MODE=production
+  queue:
+    image: build-bunny:latest
+    restart: unless-stopped
+    command: minion worker --jobs 1
+    environment:
+      - MOJO_MODE=production
