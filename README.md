@@ -1,4 +1,4 @@
-<p><img src="build-bunny.webp"><p>
+<p><img src="build-bunny.webp" height="180"><p>
 
 # build-bunny - A simple build server
 
