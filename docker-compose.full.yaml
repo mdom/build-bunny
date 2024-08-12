@@ -1,0 +1,32 @@
+services:
+  web:
+    image: build-bunny:latest
+    restart: unless-stopped
+    volumes:
+      - var:/var/lib/build-bunny
+      - /etc/build-bunny:/etc/build-bunny
+    environment:
+      - MOJO_MODE=production
+      - MOJO_CONFIG=/etc/build-bunny/build-bunny.conf
+      - BUILDBUNNY_BUILD_CONFIG=/etc/build-bunny/build.conf
+      - BUILDBUNNY_DB=/var/lib/build-bunny/minion.db
+  queue:
+    image: build-bunny:latest
+    restart: unless-stopped
+    command: minion worker --jobs 1
+    volumes:
+      - var:/var/lib/build-bunny
+      - /etc/build-bunny:/etc/build-bunny
+    environment:
+      - MOJO_MODE=production
+      - MOJO_CONFIG=/etc/build-bunny/build-bunny.conf
+      - BUILDBUNNY_BUILD_CONFIG=/etc/build-bunny/build.conf
+      - BUILDBUNNY_SCRIPT_DIR=/etc/build-bunny/scripts
+      - BUILDBUNNY_DB=/var/lib/build-bunny/minion.db
+      - BUILDBUNNY_TOKEN=secret
+      - EMAIL_SENDER_TRANSPORT=SMTP
+      - EMAIL_SENDER_TRANSPORT_host=smtp.example.com
+      - EMAIL_SENDER_TRANSPORT_port=25
+      - GIT_SSH_COMMAND=ssh -o UserKnownHostsFile=/etc/build-bunny/known_hosts -i /etc/build-bunny/id_ecdsa -o IdentitiesOnly=yes
+volumes:
+  var:
